@@ -1,0 +1,12 @@
+{
+  "name": "morphology-test-viewer",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "serve": "python -m http.server 8137"
+  },
+  "dependencies": {
+    "three": "0.171.0"
+  }
+}
