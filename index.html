@@ -32,7 +32,17 @@
 
         <label class="control">
           <span>Branch Depth <output id="max-depth-value"></output></span>
-          <input id="max-depth" type="range" min="1" max="8" step="1" value="5" />
+          <input id="max-depth" type="range" min="1" max="8" step="1" value="6" />
+        </label>
+
+        <label class="control">
+          <span>Initial Arms <output id="initial-arms-value"></output></span>
+          <input id="initial-arms" type="range" min="3" max="8" step="1" value="4" />
+        </label>
+
+        <label class="control">
+          <span>Global Angle <output id="global-angle-value"></output></span>
+          <input id="global-angle" type="range" min="0" max="359" step="1" value="0" />
         </label>
 
         <label class="control">
@@ -47,12 +57,12 @@
 
         <label class="control">
           <span>Branch Chance <output id="branch-chance-value"></output></span>
-          <input id="branch-chance" type="range" min="0" max="0.95" step="0.01" value="0.46" />
+          <input id="branch-chance" type="range" min="0" max="0.95" step="0.01" value="0.44" />
         </label>
 
         <label class="control">
-          <span>Split Angle <output id="split-angle-value"></output></span>
-          <input id="split-angle" type="range" min="10" max="75" step="1" value="32" />
+          <span>90deg Deviation <output id="split-angle-value"></output></span>
+          <input id="split-angle" type="range" min="0" max="35" step="1" value="10" />
         </label>
 
         <label class="control">
@@ -84,6 +94,8 @@
           <button id="regenerate" class="button button--ghost">Regenerate</button>
           <button id="sample-burst" class="button button--ghost">Sample x12</button>
         </div>
+
+        <button id="download-form" class="button button--ghost">Download Form (.obj)</button>
 
         <label class="toggle">
           <input id="toggle-ridges" type="checkbox" checked />
