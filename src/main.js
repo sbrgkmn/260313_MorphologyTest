@@ -19,7 +19,6 @@ const surfacesToggle = document.querySelector("#toggle-surfaces");
 const rangeControls = [
   { id: "max-depth", outputId: "max-depth-value", format: (v) => `${Math.round(v)}` },
   { id: "initial-arms", outputId: "initial-arms-value", format: (v) => `${Math.round(v)}` },
-  { id: "global-angle", outputId: "global-angle-value", format: (v) => `${Math.round(v)}deg` },
   { id: "trunk-length", outputId: "trunk-length-value", format: (v) => `${v.toFixed(1)}` },
   { id: "length-decay", outputId: "length-decay-value", format: (v) => v.toFixed(2) },
   { id: "branch-chance", outputId: "branch-chance-value", format: (v) => `${Math.round(v * 100)}%` },
@@ -29,11 +28,21 @@ const rangeControls = [
   { id: "height-decay", outputId: "height-decay-value", format: (v) => v.toFixed(2) },
   { id: "roof-width", outputId: "roof-width-value", format: (v) => `${v.toFixed(1)}` },
   { id: "width-decay", outputId: "width-decay-value", format: (v) => v.toFixed(2) }
-].map((control) => ({
-  ...control,
-  input: document.querySelector(`#${control.id}`),
-  output: document.querySelector(`#${control.outputId}`)
-}));
+]
+  .map((control) => ({
+    ...control,
+    input: document.querySelector(`#${control.id}`),
+    output: document.querySelector(`#${control.outputId}`)
+  }))
+  .filter((control) => {
+    const isValid = Boolean(control.input && control.output);
+    if (!isValid) {
+      console.warn(
+        `[Roof Ridge Generator] Missing UI node(s) for control "${control.id}". Skipping binding.`
+      );
+    }
+    return isValid;
+  });
 
 const renderer = new THREE.WebGLRenderer({ antialias: true, canvas });
 renderer.outputColorSpace = THREE.SRGBColorSpace;
@@ -90,6 +99,50 @@ function clamp(value, min, max) {
 
 function randomSeed() {
   return Math.floor(Math.random() * 0xffffffff) + 1;
+}
+
+function countStepDecimals(stepText) {
+  if (!stepText || stepText === "any") {
+    return 3;
+  }
+
+  if (stepText.includes("e") || stepText.includes("E")) {
+    const match = stepText.match(/e-(\d+)$/i);
+    return match ? Number.parseInt(match[1], 10) : 0;
+  }
+
+  const decimalIndex = stepText.indexOf(".");
+  return decimalIndex >= 0 ? stepText.length - decimalIndex - 1 : 0;
+}
+
+function formatByStep(value, stepText) {
+  const decimals = countStepDecimals(stepText);
+  if (decimals === 0) {
+    return `${Math.round(value)}`;
+  }
+  return value.toFixed(decimals);
+}
+
+function randomizeRangeInput(input) {
+  const min = Number.parseFloat(input.min);
+  const max = Number.parseFloat(input.max);
+  if (!Number.isFinite(min) || !Number.isFinite(max) || max <= min) {
+    return;
+  }
+
+  const stepText = input.getAttribute("step") ?? input.step;
+  const step =
+    stepText && stepText !== "any" ? Number.parseFloat(stepText) : Number.NaN;
+  const randomValue = min + (max - min) * Math.random();
+
+  if (Number.isFinite(step) && step > 0) {
+    const steps = Math.round((randomValue - min) / step);
+    const snapped = clamp(min + steps * step, min, max);
+    input.value = formatByStep(snapped, stepText);
+    return;
+  }
+
+  input.value = `${clamp(randomValue, min, max)}`;
 }
 
 function sanitizeSeed(value) {
@@ -429,7 +482,7 @@ function appendBoundaryWalls(surfacePositions, edgePositions, eaveHeight, wallBa
   return wallTriangleCount;
 }
 
-function buildChimneyGroup(nodes, params) {
+function buildChimneyGroup(segments, params) {
   const chimneyGroup = new THREE.Group();
   const shaftMaterial = new THREE.MeshStandardMaterial({
     color: 0x8e4d37,
@@ -443,52 +496,88 @@ function buildChimneyGroup(nodes, params) {
   });
 
   const rng = createRng(((params.seed ^ 0x7f4a7c15) >>> 0) || 1);
-  const anchors = nodes.filter(
-    (node) => node.incident.length >= 2 && node.position.z > params.eaveHeight + 1
-  );
-  if (anchors.length === 0) {
-    return { chimneyGroup, chimneyCount: 0 };
-  }
+  const candidateSegments = [];
+  let totalLength = 0;
 
-  const targetCount = clamp(Math.round(anchors.length * 0.28 + params.maxDepth * 0.35), 3, 22);
-  const placed = [];
-  let chimneyCount = 0;
-  let attempts = 0;
-
-  while (chimneyCount < targetCount && attempts < anchors.length * 7) {
-    attempts += 1;
-    const anchor = anchors[Math.floor(rng() * anchors.length)];
-    if (!anchor || rng() > 0.78) {
+  for (const segment of segments) {
+    const planDelta = new THREE.Vector2(
+      segment.end.x - segment.start.x,
+      segment.end.y - segment.start.y
+    );
+    const length = planDelta.length();
+    const averageHeight = (segment.start.z + segment.end.z) * 0.5;
+    if (length < Math.max(params.roofWidth * 0.8, 4) || averageHeight <= params.eaveHeight + 0.9) {
       continue;
     }
 
-    const planar = anchor.planar;
-    const minSpacing = Math.max(params.roofWidth * 0.65, 2.2);
+    const tangent = planDelta.normalize();
+    totalLength += length;
+    candidateSegments.push({
+      segment,
+      length,
+      tangent,
+      cumulativeLength: totalLength
+    });
+  }
+
+  if (candidateSegments.length === 0 || totalLength < PLANAR_EPSILON) {
+    return { chimneyGroup, chimneyCount: 0 };
+  }
+
+  const density = randomRange(rng, 0.018, 0.048);
+  const countBias = randomRange(rng, -1.1, 2.3);
+  const targetCount = clamp(
+    Math.round(totalLength * density + countBias),
+    1,
+    Math.min(24, candidateSegments.length * 2)
+  );
+
+  const placed = [];
+  let chimneyCount = 0;
+  let attempts = 0;
+  const maxAttempts = Math.max(targetCount * 16, candidateSegments.length * 9);
+
+  while (chimneyCount < targetCount && attempts < maxAttempts) {
+    attempts += 1;
+
+    const sampleLength = rng() * totalLength;
+    let picked = candidateSegments[candidateSegments.length - 1];
+    for (const candidate of candidateSegments) {
+      if (sampleLength <= candidate.cumulativeLength) {
+        picked = candidate;
+        break;
+      }
+    }
+
+    const { segment, tangent } = picked;
+    const t = randomRange(rng, 0.17, 0.86);
+    const axisPoint = segment.start.clone().lerp(segment.end, t);
+    const planar = new THREE.Vector2(axisPoint.x, axisPoint.y);
+    const minSpacing = Math.max(params.roofWidth * randomRange(rng, 0.5, 0.92), 2.1);
     if (placed.some((point) => point.distanceToSquared(planar) < minSpacing * minSpacing)) {
       continue;
     }
 
-    const radial = planar.lengthSq() > 1e-6 ? planar.clone().normalize() : new THREE.Vector2(1, 0);
-    const lateral = new THREE.Vector2(-radial.y, radial.x);
-    const offset = radial
-      .clone()
-      .multiplyScalar(randomRange(rng, -0.6, 0.9))
-      .add(lateral.multiplyScalar(randomRange(rng, -1.1, 1.1)));
-
     const shaftWidth = clamp(params.roofWidth * randomRange(rng, 0.13, 0.23), 0.9, 2.6);
     const shaftDepth = shaftWidth * randomRange(rng, 0.72, 1.26);
     const shaftHeight = randomRange(rng, params.ridgeHeight * 0.55, params.ridgeHeight * 1.2);
+    const sinkAmount = Math.min(
+      shaftHeight * randomRange(rng, 0.18, 0.33),
+      params.ridgeHeight * 0.5
+    );
+    const chimneyAngle = Math.atan2(tangent.y, tangent.x) + (rng() < 0.5 ? 0 : Math.PI * 0.5);
 
     const shaft = new THREE.Mesh(new THREE.BoxGeometry(shaftWidth, shaftDepth, shaftHeight), shaftMaterial);
     shaft.position.set(
-      anchor.position.x + offset.x,
-      anchor.position.y + offset.y,
-      anchor.position.z + shaftHeight * 0.5 + randomRange(rng, 0.4, 1.5)
+      axisPoint.x,
+      axisPoint.y,
+      axisPoint.z + shaftHeight * 0.5 - sinkAmount
     );
-    shaft.rotation.z = Math.atan2(radial.y, radial.x) + (rng() < 0.5 ? 0 : Math.PI * 0.5);
+    shaft.rotation.z = chimneyAngle;
     chimneyGroup.add(shaft);
 
-    const potCount = 2 + Math.floor(rng() * 3);
+    const potCount = 1 + Math.floor(rng() * 4);
+    const rowCount = Math.ceil(potCount / 2);
     for (let potIndex = 0; potIndex < potCount; potIndex += 1) {
       const column = potIndex % 2;
       const row = Math.floor(potIndex / 2);
@@ -498,17 +587,17 @@ function buildChimneyGroup(nodes, params) {
 
       const pot = new THREE.Mesh(new THREE.BoxGeometry(potWidth, potDepth, potHeight), potMaterial);
       const local = new THREE.Vector3(
-        (column - 0.5) * shaftWidth * 0.42 + randomRange(rng, -0.08, 0.08),
-        (row - 0.2) * shaftDepth * 0.3 + randomRange(rng, -0.08, 0.08),
+        (column - 0.5) * shaftWidth * 0.42 + randomRange(rng, -0.07, 0.07),
+        (row - (rowCount - 1) * 0.5) * shaftDepth * 0.34 + randomRange(rng, -0.07, 0.07),
         shaftHeight * 0.5 + potHeight * 0.5 + randomRange(rng, 0.05, 0.28)
       );
-      local.applyAxisAngle(new THREE.Vector3(0, 0, 1), shaft.rotation.z);
+      local.applyAxisAngle(new THREE.Vector3(0, 0, 1), chimneyAngle);
       pot.position.set(
         shaft.position.x + local.x,
         shaft.position.y + local.y,
         shaft.position.z + local.z
       );
-      pot.rotation.z = shaft.rotation.z + randomRange(rng, -0.08, 0.08);
+      pot.rotation.z = chimneyAngle + randomRange(rng, -0.08, 0.08);
       chimneyGroup.add(pot);
     }
 
@@ -521,31 +610,45 @@ function buildChimneyGroup(nodes, params) {
 
 function updateControlOutputs() {
   for (const control of rangeControls) {
+    if (!control.input || !control.output) {
+      continue;
+    }
     const value = Number(control.input.value);
     control.output.textContent = control.format(value);
   }
+}
+
+function getInputValueNumber(id, fallback = 0) {
+  const input = document.querySelector(`#${id}`);
+  if (!input) {
+    console.warn(`[Roof Ridge Generator] Missing input "#${id}". Falling back to ${fallback}.`);
+    return fallback;
+  }
+
+  const value = Number(input.value);
+  return Number.isFinite(value) ? value : fallback;
 }
 
 function readParams() {
   const seed = sanitizeSeed(seedInput.value);
   seedInput.value = `${seed}`;
 
+  const ridgeHeight = getInputValueNumber("ridge-height", 14);
   return {
     seed,
-    maxDepth: Number.parseInt(document.querySelector("#max-depth").value, 10),
-    initialArms: Number.parseInt(document.querySelector("#initial-arms").value, 10),
-    globalAngleDeg: Number(document.querySelector("#global-angle").value),
-    trunkLength: Number(document.querySelector("#trunk-length").value),
-    lengthDecay: Number(document.querySelector("#length-decay").value),
-    branchChance: Number(document.querySelector("#branch-chance").value),
-    splitAngleDeg: Number(document.querySelector("#split-angle").value),
-    jitterDeg: Number(document.querySelector("#jitter").value),
-    ridgeHeight: Number(document.querySelector("#ridge-height").value),
-    heightDecay: Number(document.querySelector("#height-decay").value),
-    roofWidth: Number(document.querySelector("#roof-width").value),
-    widthDecay: Number(document.querySelector("#width-decay").value),
+    maxDepth: Math.round(getInputValueNumber("max-depth", 6)),
+    initialArms: Math.round(getInputValueNumber("initial-arms", 4)),
+    trunkLength: getInputValueNumber("trunk-length", 84),
+    lengthDecay: getInputValueNumber("length-decay", 0.72),
+    branchChance: getInputValueNumber("branch-chance", 0.44),
+    splitAngleDeg: getInputValueNumber("split-angle", 10),
+    jitterDeg: getInputValueNumber("jitter", 10),
+    ridgeHeight,
+    heightDecay: getInputValueNumber("height-decay", 0.81),
+    roofWidth: getInputValueNumber("roof-width", 8),
+    widthDecay: getInputValueNumber("width-decay", 0.85),
     eaveHeight: 0,
-    wallBaseHeight: -Math.max(2.4, Number(document.querySelector("#ridge-height").value) * 0.78),
+    wallBaseHeight: -Math.max(2.4, ridgeHeight * 0.78),
     minLength: 3,
     minWidth: 0.85,
     minHeight: 0.7,
@@ -586,11 +689,11 @@ function generateRidgeSegments(params) {
 
   const center = new THREE.Vector3(0, 0, params.ridgeHeight);
   const initialBranchCount = clamp(params.initialArms, 3, 8);
-  const globalAngle = THREE.MathUtils.degToRad(params.globalAngleDeg);
+  const baseOrientation = randomRange(rng, 0, Math.PI * 2);
   for (let i = 0; i < initialBranchCount; i += 1) {
     const axisIndex = i % 4;
     const laneIndex = Math.floor(i / 4);
-    const baseAngle = globalAngle + axisIndex * (Math.PI / 2);
+    const baseAngle = baseOrientation + axisIndex * (Math.PI / 2);
     const angle = baseAngle + randomRange(rng, -jitterRadians * 0.45, jitterRadians * 0.45);
     const direction = new THREE.Vector2(Math.cos(angle), Math.sin(angle));
     const lateral = new THREE.Vector2(-direction.y, direction.x);
@@ -961,7 +1064,7 @@ function buildRoofGeometry(segments, params) {
     params.eaveHeight,
     params.wallBaseHeight
   );
-  const chimneyData = buildChimneyGroup(nodes, params);
+  const chimneyData = buildChimneyGroup(segments, params);
 
   const ridgeGeometry = new THREE.BufferGeometry();
   ridgeGeometry.setAttribute("position", new THREE.Float32BufferAttribute(ridgePositions, 3));
@@ -1024,6 +1127,18 @@ function frameModel(root) {
   grid.scale.setScalar(Math.max(0.7, (sphere.radius * 3.4) / 140));
 }
 
+function liftModelAboveGrid(root, clearance = 0.06) {
+  const bounds = new THREE.Box3().setFromObject(root);
+  if (bounds.isEmpty()) {
+    return;
+  }
+
+  const liftDelta = clearance - bounds.min.z;
+  if (Math.abs(liftDelta) > 1e-4) {
+    root.position.z += liftDelta;
+  }
+}
+
 function resize() {
   const width = app.clientWidth;
   const height = app.clientHeight;
@@ -1045,6 +1160,7 @@ function rebuildModel({ refit = false } = {}) {
 
   ridgeGroup.add(geometry.edgeObject, geometry.ridgeObject);
   surfaceGroup.add(geometry.surfaceObject, geometry.chimneyObject);
+  liftModelAboveGrid(modelRoot);
   ridgeGroup.visible = ridgeToggle.checked;
   surfaceGroup.visible = surfacesToggle.checked;
 
@@ -1076,6 +1192,17 @@ function scheduleRebuild(refit = false) {
 
 function randomizeSeed({ rebuild = true, refit = true } = {}) {
   seedInput.value = `${randomSeed()}`;
+  if (rebuild) {
+    scheduleRebuild(refit);
+  }
+}
+
+function randomizeAllParameters({ rebuild = true, refit = true } = {}) {
+  seedInput.value = `${randomSeed()}`;
+  for (const control of rangeControls) {
+    randomizeRangeInput(control.input);
+  }
+
   if (rebuild) {
     scheduleRebuild(refit);
   }
@@ -1122,26 +1249,30 @@ async function runSampleBurst() {
 }
 
 for (const control of rangeControls) {
-  control.input.addEventListener("input", () => scheduleRebuild(false));
+  control.input?.addEventListener("input", () => scheduleRebuild(false));
 }
 
-seedInput.addEventListener("change", () => {
+seedInput?.addEventListener("change", () => {
   seedInput.value = `${sanitizeSeed(seedInput.value)}`;
   scheduleRebuild(true);
 });
 
-randomizeButton.addEventListener("click", () => randomizeSeed({ rebuild: true, refit: true }));
-regenerateButton.addEventListener("click", () => scheduleRebuild(true));
-sampleBurstButton.addEventListener("click", () => {
+randomizeButton?.addEventListener("click", () =>
+  randomizeAllParameters({ rebuild: true, refit: true })
+);
+regenerateButton?.addEventListener("click", () => scheduleRebuild(true));
+sampleBurstButton?.addEventListener("click", () => {
   runSampleBurst().catch((error) => {
     console.error(error);
     setStatus(`Sampling failed: ${error.message}`);
-    sampleBurstButton.disabled = false;
+    if (sampleBurstButton) {
+      sampleBurstButton.disabled = false;
+    }
     burstRunning = false;
   });
 });
 
-downloadFormButton.addEventListener("click", () => {
+downloadFormButton?.addEventListener("click", () => {
   try {
     downloadCurrentForm();
   } catch (error) {
@@ -1150,11 +1281,11 @@ downloadFormButton.addEventListener("click", () => {
   }
 });
 
-ridgeToggle.addEventListener("change", () => {
+ridgeToggle?.addEventListener("change", () => {
   ridgeGroup.visible = ridgeToggle.checked;
 });
 
-surfacesToggle.addEventListener("change", () => {
+surfacesToggle?.addEventListener("change", () => {
   surfaceGroup.visible = surfacesToggle.checked;
 });
 
